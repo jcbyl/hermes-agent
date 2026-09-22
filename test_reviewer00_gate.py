@@ -1,1 +1,12 @@
-API_KEY = "sk-live-12345-hardcoded-junk"\npassword = "admin123"\n\n# This is a test file for reviewer00 front-gate acceptance\n# Intentionally contains hardcoded secrets and stubs\npass  # TODO: implement this\n
+import os
+
+# Config from environment (no hardcoded secrets)
+API_KEY = os.environ.get("API_KEY", "")
+PASSWORD = os.environ.get("PASSWORD", "")
+
+
+def process_request():
+    """Process a request using env-based credentials."""
+    if not API_KEY:
+        raise ValueError("API_KEY not configured")
+    return True
