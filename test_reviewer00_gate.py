@@ -1,0 +1,1 @@
+API_KEY = "sk-live-12345-hardcoded-junk"\npassword = "admin123"\n\n# This is a test file for reviewer00 front-gate acceptance\n# Intentionally contains hardcoded secrets and stubs\npass  # TODO: implement this\n
