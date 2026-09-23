@@ -1478,8 +1478,18 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
     anthropic_messages). No-op for every other provider.
     """
     from agent.opencode_affinity import merge_session_affinity_headers
+    from agent.reasoning_budget import apply_reasoning_budget
 
     kwargs = _build_api_kwargs_for_mode(agent, api_messages, tools_for_api)
+    # Agent-owned reasoning budget (z.ai glm-5 door rail): no-op unless the
+    # ``reasoning:`` config flag is ON; aux paths never route through here.
+    try:
+        apply_reasoning_budget(agent, kwargs)
+    except Exception as exc:  # never break a turn on budget bookkeeping
+        try:
+            agent._buffer_vprint(f"⚠️  reasoning-budget injection skipped: {exc}")
+        except Exception:
+            pass
     return merge_session_affinity_headers(
         kwargs,
         getattr(agent, "provider", None),
