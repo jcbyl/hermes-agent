@@ -27,6 +27,13 @@ from typing import TYPE_CHECKING
 
 from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
 
+# Cross-surface branch lock script (archie 2026-09-24). Absent on other
+# boxes → lock check silently skipped, preserving upstream portability.
+BRANCH_LOCK_SCRIPT = os.environ.get(
+    "HERMES_KANBAN_BRANCH_LOCK",
+    "/home/ubuntu/.hermes-archie/scripts/branch-lock.py",
+)
+
 if TYPE_CHECKING:
     from hermes_cli.kanban_db import Task
 
@@ -2069,6 +2076,30 @@ def _dispatch_lane_task(
     if claimed.workspace_kind == "worktree":
         _kbw.set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
     _kbw._maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
+    # Cross-surface branch lock (JC order 2026-09-24): ONE live owner per git
+    # branch, whatever board sent the work (build_queue mirror, kanban card,
+    # box session). The dispatcher only CHECKS; owners acquire/release via
+    # ~/.hermes-archie/scripts/branch-lock.py against a shared table in
+    # kanban.db. A branch held by a foreign owner must not get a second
+    # session spawned onto it (origin: t_1db4b61c on feat/app-reference-v15).
+    _bl_branch = (resolved_branch_name or claimed.branch_name or "").strip()
+    if _bl_branch and os.path.exists(BRANCH_LOCK_SCRIPT):
+        try:
+            _bl = subprocess.run(  # noqa: S603 -- fixed argv, box-local script
+                [sys.executable, BRANCH_LOCK_SCRIPT, "check", _bl_branch],
+                capture_output=True, text=True, timeout=15,
+            )
+        except Exception as _bl_exc:  # fail OPEN: lock infra outage must not stall the board
+            _kb._log.warning("kanban dispatcher: branch-lock check failed for %s: %s", _bl_branch, _bl_exc)
+            _bl = None
+        if _bl is not None and _bl.returncode == 1:
+            if _record_task_failure(
+                conn, claimed.id,
+                f"branch-lock: {_bl_branch} is held by another owner: {_bl.stdout.strip()[:200]}",
+                outcome="spawn_failed", failure_limit=failure_limit, release_claim=True, end_run=True,
+            ):
+                result.auto_blocked.append(claimed.id)
+            return False
     if lane == "review":
         # Force-load sdlc-review; the kanban lifecycle is already in every
         # worker's system prompt via KANBAN_GUIDANCE.
