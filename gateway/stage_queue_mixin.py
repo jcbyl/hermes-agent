@@ -12,6 +12,8 @@ INSTALLATION:
   - Set HERMES_STAGING_QUEUE=1 in the gateway environment
 
 Phase 1: Telegram lane only.
+
+Rework 397fc42e (was 805c8e51): uses PostgREST rail, no raw SQL.
 """
 
 import json
@@ -47,7 +49,7 @@ class StageQueueMixin:
 
         from gateway.stage_queue import (
             drain_next, mark_done, mark_dead, bump_attempt,
-            set_released_reaction, clear_reaction,
+            re_stage, set_released_reaction, clear_reaction,
             check_alarm, _STAGING_ENABLED,
         )
 
@@ -69,7 +71,6 @@ class StageQueueMixin:
             msg_id = staged["id"]
             staged_message_id = staged.get("message_id", "")
             chat_id = staged.get("chat_id", "")
-            event_data = staged.get("event", {})
 
             # Reconstruct a MessageEvent from the stored data
             try:
@@ -88,22 +89,14 @@ class StageQueueMixin:
             if session_key in self._active_sessions:  # type: ignore[attr-defined]
                 # Session is still busy (shouldn't happen — we just finished)
                 logger.warning("[stage-queue] session still active after completion, re-staging id=%s", msg_id)
-                from gateway.stage_queue import _sb_rpc
-                from urllib.parse import quote
-                await _sb_rpc("patch", "message_stage_queue",
-                              payload={"status": "staged", "updated_at": "now()"},
-                              query=quote(f"id=eq.{msg_id}"))
+                await re_stage(msg_id)
                 break
 
             # Start processing the drained message
             accepted = self._start_session_processing(reconstructed, session_key)  # type: ignore[attr-defined]
             if not accepted:
                 logger.warning("[stage-queue] session start rejected for id=%s, re-staging", msg_id)
-                from gateway.stage_queue import _sb_rpc
-                from urllib.parse import quote
-                await _sb_rpc("patch", "message_stage_queue",
-                              payload={"status": "staged", "updated_at": "now()"},
-                              query=quote(f"id=eq.{msg_id}"))
+                await re_stage(msg_id)
                 break
 
             # Only drain ONE message at a time per spec ("one message in flight per chat")
@@ -129,9 +122,19 @@ class StageQueueMixin:
             metadata=event_data.get("metadata"),
         )
 
+    async def _handle_message_while_active(self, event: MessageEvent, session_key: str) -> None:
+        """Override: if staging is enabled, persist to DB + reaction instead of
+        merging into _pending_messages. If disabled, fall through to the base
+        class handler."""
+        staged = await self._handle_message_while_active_staged(event, session_key)
+        if staged:
+            event._gateway_accepted = True  # type: ignore[attr-defined]
+            return
+        # Staging disabled or bypass command — use default behavior
+        await super()._handle_message_while_active(event, session_key)  # type: ignore[misc]
+
     async def _handle_message_while_active_staged(self, event: MessageEvent, session_key: str) -> bool:
-        """Replace the default _handle_message_while_active: persist to DB + reaction
-        instead of merging into _pending_messages.
+        """Persist to DB + reaction instead of merging into _pending_messages.
         Returns True if the message was staged (caller should skip default handling)."""
         from gateway.stage_queue import enqueue_from_event, _STAGING_ENABLED
 
@@ -139,10 +142,11 @@ class StageQueueMixin:
             return False  # Let the default handler run
 
         # Bypass commands still need to go through the inline dispatch path
-        cmd = event.get_command()
-        from hermes_cli.commands import should_bypass_active_session
-        if should_bypass_active_session(cmd):
-            return False  # Don't stage bypass commands
+        cmd = getattr(event, 'get_command', lambda: None)()
+        if cmd:
+            from hermes_cli.commands import should_bypass_active_session
+            if should_bypass_active_session(cmd):
+                return False  # Don't stage bypass commands
 
         # Stage the message
         staged = await enqueue_from_event(self, event, session_key)

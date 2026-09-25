@@ -6,6 +6,9 @@ Supabase `message_stage_queue`, and drains one-at-a-time on turn completion.
 Telegram reactions: 🕐 staged → ▶️ released → cleared on answer.
 
 Phase 1: Telegram lane only (DEV cudbvjvbkifrnszpybns).
+
+Rework 397fc42e (was 805c8e51): PostgREST rail replaces SQL-rail (Mgmt API).
+The service_role key is the ONLY writer per E-RLS. No raw SQL, no SQL injection.
 """
 
 import asyncio
@@ -89,6 +92,45 @@ async def stage_message(
         "attempts": 0,
         "event": json.loads(event_json) if isinstance(event_json, str) else event_json,
     }
+    # Dedupe (t_83288309): route through the idempotent msq_stage RPC —
+    # ON CONFLICT (platform, chat_id, message_id) DO NOTHING returns the
+    # existing row id, so duplicate platform deliveries are suppressed
+    # server-side instead of raising 409 and dropping the message.
+    rpc_payload = {
+        "p_session_key": session_key,
+        "p_platform": platform,
+        "p_chat_id": chat_id,
+        "p_message_id": message_id or "",
+        "p_sender_id": sender_id or "",
+        "p_sender_name": sender_name or "",
+        "p_event": row["event"],
+        "p_bot_name": bot_name,
+    }
+    try:
+        result = await _sb_rpc("post", "rpc/msq_stage", payload=rpc_payload)
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 404:
+            # RPC not deployed (older env) — raw insert; duplicates surface
+            # as 409 upstream, matching pre-fix behavior.
+            logger.warning("[stage-queue] msq_stage RPC unavailable (404) — raw POST fallback")
+            result = None
+        else:
+            raise
+    if result is not None:
+        row_id = None
+        if isinstance(result, str):
+            row_id = result.strip().strip('"') or None
+        elif isinstance(result, list) and result and isinstance(result[0], dict):
+            # representation-shaped response (test fake / future RPC change)
+            return result[0]
+        if row_id:
+            logger.info("[stage-queue] staged msg_id=%s session=%s row_id=%s (rpc, "
+                        "conflict=existing returned)", message_id, session_key, row_id)
+            q = quote(f"id=eq.{row_id}")
+            rows = await _sb_rpc("get", "message_stage_queue", query=q)
+            if rows:
+                return rows[0]
+            return {"id": row_id, "status": "staged", **{k: v for k, v in row.items() if k != "id"}}
     result = await _sb_rpc("post", "message_stage_queue", payload=row)
     logger.info("[stage-queue] staged msg_id=%s session=%s depth=%s",
                 message_id, session_key, await _queue_depth(session_key))
@@ -101,7 +143,7 @@ async def stage_message(
 
 async def drain_next(session_key: str) -> Optional[dict]:
     """Pop the oldest staged message for this session (FIFO by seq/created_at).
-    Sets status='processing' atomically. Returns the row or None."""
+    Sets status='processing' atomically via CAS. Returns the row or None."""
     # Fetch oldest staged
     query = quote(f"session_key=eq.{session_key}&status=eq.staged&order=seq.asc,created_at.asc&limit=1")
     rows = await _sb_rpc("get", "message_stage_queue", query=query)
@@ -120,15 +162,20 @@ async def drain_next(session_key: str) -> Optional[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Mark done / dead-letter
+# Re-stage: push a message back to staged (e.g. session still busy)
 # ---------------------------------------------------------------------------
 
-async def mark_restaged(msg_id: str) -> None:
-    """Re-stage a processing message (session was still active or start rejected)."""
+async def re_stage(msg_id: str) -> None:
+    """Reset a processing message back to 'staged' (e.g. session rejected start)."""
     query = quote(f"id=eq.{msg_id}")
     await _sb_rpc("patch", "message_stage_queue",
                   payload={"status": "staged", "updated_at": datetime.now(timezone.utc).isoformat()},
                   query=query)
+
+
+# ---------------------------------------------------------------------------
+# Mark done / dead-letter
+# ---------------------------------------------------------------------------
 
 async def mark_done(msg_id: str) -> None:
     query = quote(f"id=eq.{msg_id}")
