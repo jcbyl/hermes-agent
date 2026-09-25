@@ -173,6 +173,10 @@ async def re_stage(msg_id: str) -> None:
                   query=query)
 
 
+# Alias used by the Telegram adapter drain hook (plugins/platforms/telegram/adapter.py)
+mark_restaged = re_stage
+
+
 # ---------------------------------------------------------------------------
 # Mark done / dead-letter
 # ---------------------------------------------------------------------------

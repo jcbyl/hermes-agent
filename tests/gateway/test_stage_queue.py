@@ -55,7 +55,35 @@ def _mock_sb_rpc(monkeypatch):
 
     async def fake_sb_rpc(method: str, table: str, payload=None, query=None):
         # POST (insert)
-        if method == "post":
+        if method == "post" and table == "rpc/msq_stage":
+            # model the msq_stage RPC: ON CONFLICT (platform, chat_id, message_id)
+            # DO NOTHING — returns the existing row id on duplicate delivery.
+            p = payload or {}
+            for r in store:
+                if (str(r.get("platform")) == str(p.get("p_platform"))
+                        and str(r.get("chat_id")) == str(p.get("p_chat_id"))
+                        and str(r.get("message_id")) == str(p.get("p_message_id"))):
+                    return r["id"]
+            row = {
+                "id": f"uuid-{len(store)+1}",
+                "session_key": p.get("p_session_key"),
+                "platform": p.get("p_platform"),
+                "chat_id": p.get("p_chat_id"),
+                "bot_name": p.get("p_bot_name", ""),
+                "message_id": p.get("p_message_id", ""),
+                "sender_id": p.get("p_sender_id", ""),
+                "sender_name": p.get("p_sender_name", ""),
+                "status": "staged",
+                "seq": _seq_counter[0],
+                "attempts": 0,
+                "event": p.get("p_event"),
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+            store.append(row)
+            return row["id"]
+
+        # POST (insert)
             _seq_counter[0] += 1
             row = dict(payload) if payload else {}
             row.setdefault("id", f"uuid-{len(store)+1}")
@@ -410,3 +438,42 @@ def test_migration_enables_rls():
         assert "ENABLE ROW LEVEL SECURITY" in ddl
         assert "FORCE ROW LEVEL SECURITY" in ddl
         assert "REVOKE ALL" in ddl
+
+
+# ---------------------------------------------------------------------------
+# Dedupe (t_83288309): duplicate (platform, chat_id, message_id) deliveries
+# are suppressed server-side — stage_message returns the existing row.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_stage_message_duplicate_returns_existing_row(store):
+    first = await stage_message(
+        platform="telegram", chat_id="dup-chat", session_key="sess-dup",
+        message_id="dup-1", sender_id="u1", sender_name="Alice",
+        event_json='{"text": "first"}', bot_name="hermes",
+    )
+    rows_before = [r for r in store if r.get("message_id") == "dup-1"]
+    assert len(rows_before) == 1
+
+    second = await stage_message(
+        platform="telegram", chat_id="dup-chat", session_key="sess-dup",
+        message_id="dup-1", sender_id="u1", sender_name="Alice",
+        event_json='{"text": "duplicate delivery"}', bot_name="hermes",
+    )
+    rows_after = [r for r in store if r.get("message_id") == "dup-1"]
+    assert len(rows_after) == 1, "duplicate delivery MUST NOT create a second row"
+    assert second["id"] == first["id"], "duplicate delivery returns the existing row id"
+
+
+@pytest.mark.asyncio
+async def test_stage_message_duplicate_burst_single_row(store):
+    ids = set()
+    for i in range(10):
+        r = await stage_message(
+            platform="telegram", chat_id="burst-chat", session_key="sess-burst",
+            message_id="burst-1", sender_id="u1", sender_name="Alice",
+            event_json=f'{{"text": "burst copy {i}"}}', bot_name="hermes",
+        )
+        ids.add(r["id"])
+    rows = [r for r in store if r.get("message_id") == "burst-1"]
+    assert len(ids) == 1 and len(rows) == 1, f"10-replay burst must yield exactly 1 row (got {len(rows)})"
