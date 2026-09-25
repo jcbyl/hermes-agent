@@ -89,6 +89,50 @@ async def stage_message(
         "attempts": 0,
         "event": json.loads(event_json) if isinstance(event_json, str) else event_json,
     }
+    # Dedupe (t_83288309): route through the idempotent msq_stage RPC —
+    # ON CONFLICT (platform, chat_id, message_id) DO NOTHING returns the
+    # existing row id, so duplicate platform deliveries are suppressed
+    # server-side instead of raising 409 and dropping the message.
+    base = _sb_url().rstrip("/")
+    key = _sb_key()
+    if not base or not key:
+        raise RuntimeError("SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY not set")
+    url = f"{base}/rest/v1/rpc/msq_stage"
+    headers = {
+        "apikey": key,
+        "Authorization": f"Bearer {key}",
+        "Content-Type": "application/json",
+    }
+    rpc_payload = {
+        "p_session_key": session_key,
+        "p_platform": platform,
+        "p_chat_id": chat_id,
+        "p_message_id": message_id or "",
+        "p_sender_id": sender_id or "",
+        "p_sender_name": sender_name or "",
+        "p_event": row["event"],
+        "p_bot_name": bot_name,
+    }
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.post(url, json=rpc_payload, headers=headers)
+    if resp.status_code == 200:
+        existing_id = resp.json() if resp.text.strip() else None
+        logger.info("[stage-queue] staged msg_id=%s session=%s row_id=%s (rpc)",
+                    message_id, session_key, existing_id)
+        # Return the full row for the caller (fetch by id for representation parity)
+        if existing_id:
+            q = quote(f"id=eq.{existing_id}&select=*")
+            rows = await _sb_rpc("get", "message_stage_queue", query=q)
+            if rows:
+                return rows[0]
+        return {"id": existing_id, "status": "staged"}
+    if resp.status_code == 404:
+        # RPC not deployed (older env) — fall back to raw insert; duplicates
+        # will surface as 409 upstream, matching pre-fix behavior.
+        logger.warning("[stage-queue] msq_stage RPC unavailable (404) — raw POST fallback")
+    else:
+        logger.error("[stage-queue] msq_stage rpc %s %s", resp.status_code, resp.text[:200])
+        resp.raise_for_status()
     result = await _sb_rpc("post", "message_stage_queue", payload=row)
     logger.info("[stage-queue] staged msg_id=%s session=%s depth=%s",
                 message_id, session_key, await _queue_depth(session_key))
